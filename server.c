@@ -1,6 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/socket.h>     // socket, bind, listen, accept, sockaddr, socklen_t
+#include <netinet/ip.h>     // sockaddr_in, htons
+#include <arpa/inet.h>      // INADDR_ANY
+#include <sys/epoll.h>      // epoll_wait
 
 
 #define FALSE 0
@@ -12,6 +18,7 @@
 #define CMD_LINE_FILE_DNE 2
 #define NO_ORIGINAL_FILE 3
 #define BAD_FRAGMENT 4
+#define SOCKET_ISSUE 5
 
 #define EXPECTED_ARGS 2
 
@@ -20,6 +27,10 @@
 #define PORT_ARG 2
 
 #define DECIMAL_NUM 10
+
+//constants for socket functions
+#define LISTENING_BACKLOG 50
+#define HOST_MAX_LEN 1024
 
 int usage(char * message)
 {
@@ -41,6 +52,18 @@ int string_to_int(int * num, char * str)
     }
 
     return TRUE;
+}
+
+void print_host_network_info()
+{
+	char name[HOST_MAX_LEN];
+	memset(name, 0, HOST_MAX_LEN);
+
+    //make sure last char is '\0'
+	gethostname(name, HOST_MAX_LEN - 1);
+	printf("server hostname: %s\n", name);
+
+    
 }
 
 int main(int argc, char * argv[])
@@ -104,6 +127,39 @@ int main(int argc, char * argv[])
     //we are done looking through the cmd line file
     free(line);
     fclose(file_cmd_input);
+
+    //SOCKET TIME YO!
+
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+
+    //check if valid socket file descriptor
+    if(sfd == -1)
+    {
+        printf("Error Creating Socket: %s\n", strerror(errno));
+        return SOCKET_ISSUE;
+    }
+
+    struct sockaddr_in addr;
+    //clear struct
+    memset(&addr, 0, sizeof(struct sockaddr_in));
+    //AF_INET domain address
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if(bind(sfd, (struct sockaddr *) &addr, sizeof(struct sockaddr_in)) == -1)
+    {
+        printf("Error Binding Socket: %s\n", strerror(errno));
+        return SOCKET_ISSUE;
+    }
+
+
+    if(listen(sfd, LISTENING_BACKLOG) == -1)
+    {
+        printf("Error Setting up Socket to Listen: %s\n", strerror(errno));
+        return SOCKET_ISSUE;
+    }
+
 
 
 
