@@ -54,3 +54,6 @@ dkms.conf
 #my executables
 server
 client
+
+#other stuff
+.json
