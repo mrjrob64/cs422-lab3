@@ -21,6 +21,7 @@
 #define NO_ORIGINAL_FILE 3
 #define BAD_FRAGMENT 4
 #define SOCKET_ISSUE 5
+#define EPOLL_ISSUE 6
 
 #define EXPECTED_ARGS 2
 
@@ -33,6 +34,133 @@
 //constants for socket functions
 #define LISTENING_BACKLOG 50
 #define HOST_MAX_LEN 1024
+
+#define BUFFER_RW_SIZE 1024
+
+
+//Balanced AVL Tree created partly by me and partly by chatgpt
+
+struct btree {
+    struct btree *left;
+    struct btree *right;
+    int line_num;
+    char *line;
+    int height;
+};
+
+// Utility: get node height (NULL nodes have height 0)
+static int height(struct btree *n) {
+    return n ? n->height : 0;
+}
+
+// Utility: max of two ints
+static int max(int a, int b) {
+    return (a > b) ? a : b;
+}
+
+// Create a new node
+static struct btree *new_node(int line_num, const char *line) {
+    struct btree *node = malloc(sizeof(*node));
+    if (!node) return NULL;
+    node->line_num = line_num;
+    node->line = strdup(line);
+    node->left = node->right = NULL;
+    node->height = 1;  // new node is initially a leaf
+    return node;
+}
+
+// Right-rotate subtree rooted at y
+static struct btree *right_rotate(struct btree *y) {
+    struct btree *x = y->left;
+    struct btree *T2 = x->right;
+
+    // Perform rotation
+    x->right = y;
+    y->left = T2;
+
+    // Update heights
+    y->height = max(height(y->left), height(y->right)) + 1;
+    x->height = max(height(x->left), height(x->right)) + 1;
+
+    // Return new root
+    return x;
+}
+
+// Left-rotate subtree rooted at x
+static struct btree *left_rotate(struct btree *x) {
+    struct btree *y = x->right;
+    struct btree *T2 = y->left;
+
+    // Perform rotation
+    y->left = x;
+    x->right = T2;
+
+    // Update heights
+    x->height = max(height(x->left), height(x->right)) + 1;
+    y->height = max(height(y->left), height(y->right)) + 1;
+
+    // Return new root
+    return y;
+}
+
+// Get balance factor of node (left height minus right height)
+static int get_balance(struct btree *n) {
+    return n ? height(n->left) - height(n->right) : 0;
+}
+
+// Insert a key/value into the AVL tree, rebalancing as needed
+struct btree *add(struct btree *node, int line_num, const char *line) {
+    // 1. Perform standard BST insertion
+    if (!node)
+        return new_node(line_num, line);
+
+    if (line_num < node->line_num)
+        node->left = add(node->left, line_num, line);
+    else if (line_num > node->line_num)
+        node->right = add(node->right, line_num, line);
+    else
+        return node; // Duplicate keys not allowed; ignore or handle as needed
+
+    // 2. Update height of this ancestor node
+    node->height = 1 + max(height(node->left), height(node->right));
+
+    // 3. Get the balance factor
+    int balance = get_balance(node);
+
+    // 4. If unbalanced, there are 4 cases
+    // Left Left Case
+    if (balance > 1 && line_num < node->left->line_num)
+        return right_rotate(node);
+
+    // Right Right Case
+    if (balance < -1 && line_num > node->right->line_num)
+        return left_rotate(node);
+
+    // Left Right Case
+    if (balance > 1 && line_num > node->left->line_num) {
+        node->left = left_rotate(node->left);
+        return right_rotate(node);
+    }
+
+    // Right Left Case
+    if (balance < -1 && line_num < node->right->line_num) {
+        node->right = right_rotate(node->right);
+        return left_rotate(node);
+    }
+
+    // Return the (unchanged) node pointer
+    return node;
+}
+
+// Free all nodes in the tree
+void free_all(struct btree *root) {
+    if (!root) return;
+    free_all(root->left);
+    free_all(root->right);
+    free(root->line);
+    free(root);
+}
+
 
 int usage(char * message)
 {
@@ -204,13 +332,13 @@ int main(int argc, char * argv[])
 
     FILE * file_original = fopen(line, "r");
 
-    FILE ** fragment_files = NULL;
+    int * fragment_files = NULL;
     int index = 0;
 
     while ((nread = getline(&line, &size, file_cmd_input)) != -1) {
         line[nread - 1] = '\0';
-        fragment_files = (FILE**) realloc(fragment_files, sizeof(FILE *) * (index + 1));
-        fragment_files[index] = fopen(line, "r");
+        fragment_files = (int *) realloc(fragment_files, sizeof(int) * (index + 1));
+        fragment_files[index] = open(line, O_RDONLY);
         
         if(fragment_files[index] == NULL)
         {
@@ -308,16 +436,21 @@ int main(int argc, char * argv[])
                 ev.events = EPOLLIN | EPOLLRDHUP;
                 ev.data.fd = cfd;
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev) == -1) {
-                    perror("epoll_ctl: client add");
-                    return 1;
+                    printf("Error Adding to EPOLL: %s\n", strerror(errno));
+                    return EPOLL_ISSUE;
                 }
 
+                //TODO: Change this to send a fixed amount of client (so the client can make sure it receieved the right amount of bits)
+                //TODO: Switch from FILE pointers to file descriptors
                 //send data from current file to client
-                FILE * file_to_send = fragment_files[file_index];
-                int line_index = 0;
-                while ((nread = getline(&line, &size, file_to_send)) != -1) {
-                    
-                    fprintf(file_to_send, line);
+                int file_to_send_fd = fragment_files[file_index];
+                char buffer[BUFFER_RW_SIZE];
+                ssize_t bytesRead;
+                while (read(file_to_send_fd, buffer, sizeof(buffer) - 1) != -1) {
+
+                    printf("Sending file fragment %d to a client\n", file_index);
+                    write(file_to_send_fd, buffer, sizeof(buffer) - 1);
+
                 }
 
                 //increment file index to prepare sending next file

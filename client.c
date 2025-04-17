@@ -27,6 +27,133 @@
 
 #define HOST_MAX_LEN 1024
 
+#define BUFFER_RW_SIZE 1024
+
+#define DELIMITER '\n'
+
+//Balanced AVL Tree created partly by me and partly by chatgpt
+
+struct btree {
+    struct btree *left;
+    struct btree *right;
+    int line_num;
+    char *line;
+    int height;
+};
+
+// Utility: get node height (NULL nodes have height 0)
+static int height(struct btree *n) {
+    return n ? n->height : 0;
+}
+
+// Utility: max of two ints
+static int max(int a, int b) {
+    return (a > b) ? a : b;
+}
+
+// Create a new node
+static struct btree *new_node(int line_num, const char *line) {
+    struct btree *node = malloc(sizeof(*node));
+    if (!node) return NULL;
+    node->line_num = line_num;
+    node->line = strdup(line);
+    node->left = node->right = NULL;
+    node->height = 1;  // new node is initially a leaf
+    return node;
+}
+
+// Right-rotate subtree rooted at y
+static struct btree *right_rotate(struct btree *y) {
+    struct btree *x = y->left;
+    struct btree *T2 = x->right;
+
+    // Perform rotation
+    x->right = y;
+    y->left = T2;
+
+    // Update heights
+    y->height = max(height(y->left), height(y->right)) + 1;
+    x->height = max(height(x->left), height(x->right)) + 1;
+
+    // Return new root
+    return x;
+}
+
+// Left-rotate subtree rooted at x
+static struct btree *left_rotate(struct btree *x) {
+    struct btree *y = x->right;
+    struct btree *T2 = y->left;
+
+    // Perform rotation
+    y->left = x;
+    x->right = T2;
+
+    // Update heights
+    x->height = max(height(x->left), height(x->right)) + 1;
+    y->height = max(height(y->left), height(y->right)) + 1;
+
+    // Return new root
+    return y;
+}
+
+// Get balance factor of node (left height minus right height)
+static int get_balance(struct btree *n) {
+    return n ? height(n->left) - height(n->right) : 0;
+}
+
+// Insert a key/value into the AVL tree, rebalancing as needed
+struct btree *add(struct btree *node, int line_num, const char *line) {
+    // 1. Perform standard BST insertion
+    if (!node)
+        return new_node(line_num, line);
+
+    if (line_num < node->line_num)
+        node->left = add(node->left, line_num, line);
+    else if (line_num > node->line_num)
+        node->right = add(node->right, line_num, line);
+    else
+        return node; // Duplicate keys not allowed; ignore or handle as needed
+
+    // 2. Update height of this ancestor node
+    node->height = 1 + max(height(node->left), height(node->right));
+
+    // 3. Get the balance factor
+    int balance = get_balance(node);
+
+    // 4. If unbalanced, there are 4 cases
+    // Left Left Case
+    if (balance > 1 && line_num < node->left->line_num)
+        return right_rotate(node);
+
+    // Right Right Case
+    if (balance < -1 && line_num > node->right->line_num)
+        return left_rotate(node);
+
+    // Left Right Case
+    if (balance > 1 && line_num > node->left->line_num) {
+        node->left = left_rotate(node->left);
+        return right_rotate(node);
+    }
+
+    // Right Left Case
+    if (balance < -1 && line_num < node->right->line_num) {
+        node->right = right_rotate(node->right);
+        return left_rotate(node);
+    }
+
+    // Return the (unchanged) node pointer
+    return node;
+}
+
+// Free all nodes in the tree
+void free_all(struct btree *root) {
+    if (!root) return;
+    free_all(root->left);
+    free_all(root->right);
+    free(root->line);
+    free(root);
+}
+
 int usage(char * message)
 {
     printf("Expected ./client <ip> <port>\n%s\n", message);
@@ -130,6 +257,13 @@ int main(int argc, char ** argv)
 	}
 	
     print_host_network_info();
+
+    char buf [BUFFER_RW_SIZE];
+
+    while(read(sfd, buf, BUFFER_RW_SIZE) != EOF)
+    {
+        
+    }
 
 	if(close(sfd) == -1)
 	{
