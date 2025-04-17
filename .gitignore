@@ -56,4 +56,4 @@ server
 client
 
 #other stuff
-.json
+settings.json
