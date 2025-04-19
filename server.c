@@ -9,6 +9,8 @@
 #include <sys/epoll.h>      // epoll_wait
 #include <netdb.h>
 #include <sys/types.h>
+#include <fcntl.h>
+
 
 
 #define FALSE 0
@@ -38,130 +40,211 @@
 
 #define BUFFER_RW_SIZE 1024
 
+#define DELIMITER '\n'
+
+
+//holds info about client
+//used for knowing 
+struct client_buff_info
+{
+    int line_index;
+    int curr_len_line;
+};
 
 //Balanced AVL Tree created partly by me and partly by chatgpt
 
+// AVL-balanced binary tree node. 'line' is caller-allocated; tree takes ownership.
 struct btree {
     struct btree *left;
     struct btree *right;
     int line_num;
     char *line;
+    int line_length;
     int height;
 };
 
-// Utility: get node height (NULL nodes have height 0)
+// Get height of a node (NULL -> 0)
 static int height(struct btree *n) {
     return n ? n->height : 0;
 }
 
-// Utility: max of two ints
+// Return max of two ints
 static int max(int a, int b) {
     return (a > b) ? a : b;
 }
 
-// Create a new node
-static struct btree *new_node(int line_num, const char *line) {
-    struct btree *node = malloc(sizeof(*node));
-    if (!node) return NULL;
-    node->line_num = line_num;
-    node->line = strdup(line);
-    node->left = node->right = NULL;
-    node->height = 1;  // new node is initially a leaf
-    return node;
-}
-
-// Right-rotate subtree rooted at y
+// Right rotate subtree rooted at y
 static struct btree *right_rotate(struct btree *y) {
     struct btree *x = y->left;
     struct btree *T2 = x->right;
 
-    // Perform rotation
     x->right = y;
-    y->left = T2;
+    y->left  = T2;
 
     // Update heights
     y->height = max(height(y->left), height(y->right)) + 1;
     x->height = max(height(x->left), height(x->right)) + 1;
 
-    // Return new root
     return x;
 }
 
-// Left-rotate subtree rooted at x
+// Left rotate subtree rooted at x
 static struct btree *left_rotate(struct btree *x) {
     struct btree *y = x->right;
     struct btree *T2 = y->left;
 
-    // Perform rotation
-    y->left = x;
+    y->left  = x;
     x->right = T2;
 
     // Update heights
     x->height = max(height(x->left), height(x->right)) + 1;
     y->height = max(height(y->left), height(y->right)) + 1;
 
-    // Return new root
     return y;
 }
 
-// Get balance factor of node (left height minus right height)
+// Compute balance factor of n: left height - right height
 static int get_balance(struct btree *n) {
     return n ? height(n->left) - height(n->right) : 0;
 }
 
-// Insert a key/value into the AVL tree, rebalancing as needed
-struct btree *add(struct btree *node, int line_num, const char *line) {
-    // 1. Perform standard BST insertion
-    if (!node)
-        return new_node(line_num, line);
-
-    if (line_num < node->line_num)
-        node->left = add(node->left, line_num, line);
-    else if (line_num > node->line_num)
-        node->right = add(node->right, line_num, line);
-    else
-        return node; // Duplicate keys not allowed; ignore or handle as needed
-
-    // 2. Update height of this ancestor node
-    node->height = 1 + max(height(node->left), height(node->right));
-
-    // 3. Get the balance factor
+// Rebalance node if unbalanced, using child's balance
+static struct btree *rebalance(struct btree *node) {
     int balance = get_balance(node);
-
-    // 4. If unbalanced, there are 4 cases
-    // Left Left Case
-    if (balance > 1 && line_num < node->left->line_num)
-        return right_rotate(node);
-
-    // Right Right Case
-    if (balance < -1 && line_num > node->right->line_num)
-        return left_rotate(node);
-
-    // Left Right Case
-    if (balance > 1 && line_num > node->left->line_num) {
-        node->left = left_rotate(node->left);
-        return right_rotate(node);
+    
+    // Left heavy
+    if (balance > 1) {
+        if (get_balance(node->left) >= 0) {
+            // LL case
+            return right_rotate(node);
+        } else {
+            // LR case
+            node->left = left_rotate(node->left);
+            return right_rotate(node);
+        }
     }
-
-    // Right Left Case
-    if (balance < -1 && line_num < node->right->line_num) {
-        node->right = right_rotate(node->right);
-        return left_rotate(node);
+    // Right heavy
+    if (balance < -1) {
+        if (get_balance(node->right) <= 0) {
+            // RR case
+            return left_rotate(node);
+        } else {
+            // RL case
+            node->right = right_rotate(node->right);
+            return left_rotate(node);
+        }
     }
-
-    // Return the (unchanged) node pointer
     return node;
 }
 
-// Free all nodes in the tree
-void free_all(struct btree *root) {
-    if (!root) return;
-    free_all(root->left);
-    free_all(root->right);
-    free(root->line);
-    free(root);
+// Create new node, taking ownership of 'line'
+struct btree *new_node(int line_num, char *line, int line_length) {
+    struct btree *n = malloc(sizeof(*n));
+    if (!n) return NULL;
+    n->line_num = line_num;
+    n->line     = line;
+    n->left = n->right = NULL;
+    n->line_length = line_length;
+    n->height = 1;
+    return n;
 }
 
+// Insert a node, rebalance along the way
+struct btree *add(struct btree *root, int line_num, char *line, int line_length) {
+    if (!root)
+        return new_node(line_num, line, line_length);
+
+    if (line_num < root->line_num) {
+        root->left  = add(root->left,  line_num, line, line_length);
+    } else if (line_num > root->line_num) {
+        root->right = add(root->right, line_num, line, line_length);
+    } else {
+        printf("Duplicate line number (%d) given. Skipping this node\n", line_num);
+        free(line);
+        return root;
+    }
+
+    // update height
+    root->height = 1 + max(height(root->left), height(root->right));
+    // rebalance
+    return rebalance(root);
+}
+
+// Find node with minimum key
+struct btree *find_min(struct btree *root) {
+    while (root && root->left)
+        root = root->left;
+    return root;
+}
+
+// Delete node by key, rebalance, free line and node
+struct btree *delete_node(struct btree *root, struct btree *node) {
+    if (!root || !node) return root;
+
+    if (node->line_num < root->line_num) {
+        root->left = delete_node(root->left, node);
+    }
+    else if (node->line_num > root->line_num) {
+        root->right = delete_node(root->right, node);
+    }
+    else {
+        if (!root->left || !root->right) {
+            struct btree *temp = root->left ? root->left : root->right;
+            free(root->line);
+            free(root);
+            return temp;
+        }
+        else {
+            struct btree *succ = find_min(root->right);
+            root->line_num = succ->line_num;
+            root->line = succ->line;
+            root->right = delete_node(root->right, succ);
+        }
+    }
+
+    root->height = 1 + max(height(root->left), height(root->right));
+    return rebalance(root);
+}
+
+//get position of delim for messages
+int position_delim(char * str, int len, char delim)
+{
+	for(int i = 0; i < len; i++)
+	{
+		//printf("%c\n", str[i]);
+		if(str[i] == delim)
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+
+//for writing to a string with a current length 
+//and an index where writing will happen (line_index)
+void get_mem_for_line(char * line, int * line_index, int * curr_len_line, int amount)
+{
+    //case 1: line has nothing in it rn
+    if(line == NULL)
+    {
+        *line_index = 0;
+        *curr_len_line = amount;
+
+        //1 additional char for end string '\0'
+        line = malloc((*curr_len_line) * sizeof(char) + 1);
+        
+    }
+    //case 2: line has something in it already
+    else
+    {
+        *line_index = *curr_len_line;
+        *curr_len_line += amount;
+
+        //should already have the additional char for end string '\0'
+        line = realloc(curr_len_line, (*curr_len_line) * sizeof(char));
+
+    }
+}
 
 int usage(char * message)
 {
@@ -269,31 +352,6 @@ void print_socket_details(int sockfd) {
     printf("Port: %d\n", port);
 }
 
-//connects the connected client and print out client info
-int handle_connection(int sfd)
-{
-    struct sockaddr_in c_addr;
-    socklen_t clen = sizeof(struct sockaddr_in);
-    cfd = accept(sfd, (struct sockaddr *) &c_addr, &clen );
-
-    if(cfd == -1)
-    {
-        printf("Error Accepting Connection: %s\n", strerror(errno));
-        return SOCKET_ISSUE;
-    }
-    printf("Made new connection\n");
-
-    print_socket_details(cfd);
-
-    ev.events = EPOLLIN | EPOLLRDHUP;
-    ev.data.fd = cfd;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev) == -1) {
-        perror("epoll_ctl: client add");
-        return 1;
-    }
-    return SUCCESS;
-}
-
 int main(int argc, char * argv[])
 {
     int num_args = argc - 1;
@@ -341,7 +399,7 @@ int main(int argc, char * argv[])
         fragment_files = (int *) realloc(fragment_files, sizeof(int) * (index + 1));
         fragment_files[index] = open(line, O_RDONLY);
         
-        if(fragment_files[index] == NULL)
+        if(fragment_files[index] == -1)
         {
             printf("Fragment[%d] did not open\nFile name given: %s\n", index, line);
             return BAD_FRAGMENT;
@@ -410,6 +468,9 @@ int main(int argc, char * argv[])
     int cont = 1;
     int cfd;
     int ret_val;
+
+    struct btree *root = NULL;
+
     while(cont)
 	{
         int num_events = epoll_wait(epfd, evlist, num_fragment_files, -1);
@@ -436,13 +497,17 @@ int main(int argc, char * argv[])
 
                 ev.events = EPOLLIN | EPOLLRDHUP;
                 ev.data.fd = cfd;
+                ev.data.ptr = malloc(sizeof(struct client_buff_info));
+
+                struct client_buff_info * cb = (struct client_buff_info *) ev.data.ptr;
+                cb->line_index = 0;
+                cb->curr_len_line = 0;
+
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev) == -1) {
                     printf("Error Adding to EPOLL: %s\n", strerror(errno));
                     return EPOLL_ISSUE;
                 }
 
-                //TODO: Change this to send a fixed amount of client (so the client can make sure it receieved the right amount of bits)
-                //TODO: Switch from FILE pointers to file descriptors
                 //send data from current file to client
                 int file_to_send_fd = fragment_files[file_index];
                 char buffer[BUFFER_RW_SIZE];
@@ -472,8 +537,72 @@ int main(int argc, char * argv[])
             //Receiving Info from client!
             if((fd != sfd) && (events & EPOLLIN))
             {
+                int index;
+                int last_index = 0;
+
                 char buf[BUFFER_RW_SIZE];
+                memset(buf, 0, BUFFER_RW_SIZE);
                 read(fd, buf, BUFFER_RW_SIZE);
+
+                struct client_buff_info * cb = (struct client_buff_info *) ev.data.ptr;
+
+                //each time we find the next delim, we start where we left off by adding last_index
+                while ((index = position_delim(buf + last_index, BUFFER_RW_SIZE - last_index, DELIMITER)) != -1) {
+
+
+                    //index does not start from beggining every time
+                    //so the indexes need to be accumulated
+                    index += last_index;
+
+                    get_mem_for_line(line, &cb->line_index, &cb->curr_len_line, index - last_index);
+
+                    line[cb->curr_len_line - 1] = '\0';
+
+                    // Copy the message fragment that ends at the delimiter.
+                    memcpy(line + cb->line_index, buf + last_index, index - last_index);
+
+                    int line_num;
+                    sscanf(line, "%d", &line_num);
+
+                    //add the line to the tree data structure
+                    root = add(root, line_num, line, cb->curr_len_line);
+                    line = NULL;
+
+                    // Reset for a new message.
+                    cb->line_index = 0;
+
+                    //move past the delim
+                    last_index = index + 1;
+
+                }
+                
+
+                //if there is still some chars left in buffer (ie we have not reached the delimiter once reaching the end)
+                if(last_index < BUFFER_RW_SIZE)
+                {
+                    int buffer_size;
+
+                    //There might not be a full buffer (ie there might be a '\0' character before the end)
+                    //do not want to write a bunch of '\0' in between strings
+                    if((index = position_delim(buf + last_index, BUFFER_RW_SIZE - last_index, '\0')) == -1)
+                    {
+                        //no terminating char
+                        buffer_size = BUFFER_RW_SIZE;
+                    }
+                    else
+                    {
+                        buffer_size = index + last_index;
+                    }
+
+                    get_mem_for_line(line, &cb->line_index, &cb->curr_len_line, index - last_index);
+
+                    memcpy(line + cb->line_index, buf + last_index, buffer_size - last_index);
+                    cb->line_index += (buffer_size - last_index);
+                    
+                }
+
+                //set the buf back to '\0' chars
+                memset(buf, 0, BUFFER_RW_SIZE);
             }
 
             //Client Disconnecting!
@@ -482,19 +611,34 @@ int main(int argc, char * argv[])
                 printf("Client disconnected!\n");
 				ev.events = EPOLLIN | EPOLLRDHUP;
 				ev.data.fd = cfd;
+                free(ev.data.ptr);
 				epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, NULL);
 				close(cfd);
             }
         }
 
-		
+    }
+
+    int curr_len_line;
+    int line_index;
+    //print out recombined file
+    while(root != NULL)
+    {
+        //get lowest line number node
+        struct btree * min_node = find_min(root);
+
+        //print the line to the terminal
+        printf("%s", min_node->line_num);
+
+        //delete and free lowest line number node
+        delete_node(root, min_node);
     }
 
     //close and free all opened files
     fclose(file_original);
     for(int i = 0; i < num_fragment_files; i++)
     {
-        fclose(fragment_files[i]);
+        close(fragment_files[i]);
     }
     free(fragment_files);
 

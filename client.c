@@ -19,6 +19,8 @@
 
 #define SUCCESS 0
 #define INCORRECT_CMD_ARGS 1
+#define FAILED_TO_CLOSE_FD 2
+#define FAILED_TO_READ_FD 3
 
 #define EXPECTED_ARGS 2
 
@@ -176,8 +178,22 @@ struct btree *delete_node(struct btree *root, struct btree *node) {
         }
         else {
             struct btree *succ = find_min(root->right);
-            root->line_num = succ->line_num;
-            root->line = succ->line;
+            if (root->line) {
+                free(root->line);
+                // No need to set root->line = NULL yet, it's about to be overwritten
+            }
+
+            // 2. Copy the inorder successor's data to this node
+            root->line_num    = succ->line_num;
+            root->line        = succ->line;        // Take ownership of successor's line pointer
+            root->line_length = succ->line_length; // Copy length too
+
+            // 3. IMPORTANT: Nullify the original successor's line pointer.
+            //    This prevents the recursive delete call below from freeing
+            //    the memory that 'root' now points to.
+            succ->line        = NULL;
+            succ->line_length = 0; // Also reset length for consistency
+
             root->right = delete_node(root->right, succ);
         }
     }
@@ -202,7 +218,7 @@ int position_delim(char * str, int len, char delim)
 
 //for writing to a string with a current length 
 //and an index where writing will happen (line_index)
-void get_mem_for_line(char * line, int * line_index, int * curr_len_line, int amount)
+void get_mem_for_line(char ** line, int * line_index, int * curr_len_line, int amount)
 {
     //case 1: line has nothing in it rn
     if(line == NULL)
@@ -211,35 +227,21 @@ void get_mem_for_line(char * line, int * line_index, int * curr_len_line, int am
         *curr_len_line = amount;
 
         //1 additional char for end string '\0'
-        line = malloc((*curr_len_line) * sizeof(char) + 1);
+        *line = malloc((*curr_len_line + 1) * sizeof(char));
         
     }
     //case 2: line has something in it already
     else
     {
-        *line_index = curr_len_line;
+        *line_index = *curr_len_line;
         *curr_len_line += amount;
 
         //should already have the additional char for end string '\0'
-        line = realloc(curr_len_line, (*curr_len_line) * sizeof(char));
+        *line = realloc(*line, (*curr_len_line) * sizeof(char));
 
     }
 }
 
-int round_down(int num, int round_mul)
-{
-    if (round_mul == 0) 
-    {
-        return num;
-    }
-
-    int remainder = num % round_mul;
-    if (remainder == 0) 
-    {
-        return num;
-    }
-    return num - remainder;
-}
 
 int usage(char * message)
 {
@@ -353,9 +355,15 @@ int main(int argc, char ** argv)
     int curr_len_line = 0;
     struct btree *root = NULL;
 
+    ssize_t bytes_read;
     //Add functionality from buffer to string
-    while(read(sfd, buf, BUFFER_RW_SIZE) != EOF)
+    while((bytes_read = read(sfd, buf, BUFFER_RW_SIZE)) != EOF)
     {
+        //failed to read bytes so trying again
+        if(bytes_read == -1)
+        {
+            continue;
+        }
         int index;
         int last_index = 0;
 
@@ -367,9 +375,9 @@ int main(int argc, char ** argv)
             //so the indexes need to be accumulated
             index += last_index;
 
-            get_mem_for_line(line, &line_index, &curr_len_line, index - last_index);
+            get_mem_for_line(&line, &line_index, &curr_len_line, index - last_index);
 
-            line[curr_len_line - 1] = '\0';
+            line[curr_len_line] = '\0';
 
             // Copy the message fragment that ends at the delimiter.
             memcpy(line + line_index, buf + last_index, index - last_index);
@@ -378,7 +386,7 @@ int main(int argc, char ** argv)
             sscanf(line, "%d", &line_num);
 
             //add the line to the tree data structure
-            root = add(root, line_num, line);
+            root = add(root, line_num, line, curr_len_line);
             line = NULL;
 
             // Reset for a new message.
@@ -407,15 +415,21 @@ int main(int argc, char ** argv)
                 buffer_size = index + last_index;
             }
 
-            get_mem_for_line(line, &line_index, &curr_len_line, index - last_index);
+            get_mem_for_line(&line, &line_index, &curr_len_line, index - last_index);
 
-            strncat(line, buf + last_index, buffer_size - last_index);
+            memcpy(line + line_index, buf + last_index, buffer_size - last_index);
             line_index += (buffer_size - last_index);
             
         }
 
         //set the buf back to '\0' chars
         memset(buf, 0, BUFFER_RW_SIZE);
+    }
+
+    if(bytes_read == -1)
+    {
+        printf("Error reading data from server: %s\n", strerror(errno));
+		return FAILED_TO_READ_FD;
     }
 
     //write sorted lines back to server
@@ -449,7 +463,7 @@ int main(int argc, char ** argv)
 	if(close(sfd) == -1)
 	{
 		printf("Failed to close: %s\n", strerror(errno));
-		return 1;
+		return FAILED_TO_CLOSE_FD;
 	}
 
 	return 0;
