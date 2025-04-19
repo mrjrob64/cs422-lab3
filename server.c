@@ -22,6 +22,7 @@
 #define BAD_FRAGMENT 4
 #define SOCKET_ISSUE 5
 #define EPOLL_ISSUE 6
+#define ERROR_READING_FILE 7
 
 #define EXPECTED_ARGS 2
 
@@ -445,12 +446,20 @@ int main(int argc, char * argv[])
                 //send data from current file to client
                 int file_to_send_fd = fragment_files[file_index];
                 char buffer[BUFFER_RW_SIZE];
+                memset(buffer, 0, BUFFER_RW_SIZE);
                 ssize_t bytesRead;
-                while (read(file_to_send_fd, buffer, sizeof(buffer) - 1) != -1) {
+                while ((bytesRead = read(file_to_send_fd, buffer, BUFFER_RW_SIZE)) > 0) {
 
                     printf("Sending file fragment %d to a client\n", file_index);
-                    write(file_to_send_fd, buffer, sizeof(buffer) - 1);
+                    write(cfd, buffer, BUFFER_RW_SIZE);
 
+                    memset(buffer, 0, BUFFER_RW_SIZE);
+                }
+
+                if(bytesRead == -1)
+                {
+                    printf("Error Reading Fragment File %d: %s\n", file_index, strerror(errno));
+                    return ERROR_READING_FILE;
                 }
 
                 //increment file index to prepare sending next file
@@ -463,8 +472,8 @@ int main(int argc, char * argv[])
             //Receiving Info from client!
             if((fd != sfd) && (events & EPOLLIN))
             {
-                char buf[1024];
-                read(fd, buf, 1023);
+                char buf[BUFFER_RW_SIZE];
+                read(fd, buf, BUFFER_RW_SIZE);
             }
 
             //Client Disconnecting!
