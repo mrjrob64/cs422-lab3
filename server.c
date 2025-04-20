@@ -45,8 +45,9 @@
 
 //holds info about client
 //used for knowing 
-struct client_buff_info
+struct buff_info
 {
+    int cfd;
     int line_index;
     int curr_len_line;
 };
@@ -222,16 +223,16 @@ int position_delim(char * str, int len, char delim)
 
 //for writing to a string with a current length 
 //and an index where writing will happen (line_index)
-void get_mem_for_line(char * line, int * line_index, int * curr_len_line, int amount)
+void get_mem_for_line(char ** line, int * line_index, int * curr_len_line, int amount)
 {
     //case 1: line has nothing in it rn
-    if(line == NULL)
+    if(*line == NULL)
     {
         *line_index = 0;
         *curr_len_line = amount;
 
         //1 additional char for end string '\0'
-        line = malloc((*curr_len_line) * sizeof(char) + 1);
+        *line = malloc((*curr_len_line + 1) * sizeof(char));
         
     }
     //case 2: line has something in it already
@@ -241,7 +242,7 @@ void get_mem_for_line(char * line, int * line_index, int * curr_len_line, int am
         *curr_len_line += amount;
 
         //should already have the additional char for end string '\0'
-        line = realloc(curr_len_line, (*curr_len_line) * sizeof(char));
+        *line = realloc(*line, (*curr_len_line) * sizeof(char));
 
     }
 }
@@ -456,7 +457,11 @@ int main(int argc, char * argv[])
 	//add event listener for stdin
 	struct epoll_event ev;
 	ev.events = EPOLLIN;
-	ev.data.fd = sfd;
+
+    ev.data.ptr = malloc(sizeof(struct buff_info));
+
+    struct buff_info * cb = (struct buff_info *) ev.data.ptr;
+    cb->cfd = sfd;
 
 	if (epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev) == -1)
 	{
@@ -465,19 +470,24 @@ int main(int argc, char * argv[])
 	}
 
     int file_index = 0;
-    int cont = 1;
+    //int cont = 1;
     int cfd;
     int ret_val;
+    int num_clients_done = 0;
 
     struct btree *root = NULL;
 
-    while(cont)
+    while(num_clients_done < num_fragment_files)
 	{
         int num_events = epoll_wait(epfd, evlist, num_fragment_files, -1);
+        printf("smth happened.\n");
 
         for(int i = 0; i < num_events; i++)
         {
-            int fd = evlist[i].data.fd;
+
+            struct buff_info * cb = (struct buff_info *) evlist[i].data.ptr;
+
+            int fd = cb->cfd;
 			uint32_t events = evlist[i].events;
 
             //New Connection!
@@ -496,12 +506,12 @@ int main(int argc, char * argv[])
                 print_socket_details(cfd);
 
                 ev.events = EPOLLIN | EPOLLRDHUP;
-                ev.data.fd = cfd;
-                ev.data.ptr = malloc(sizeof(struct client_buff_info));
+                ev.data.ptr = malloc(sizeof(struct buff_info));
 
-                struct client_buff_info * cb = (struct client_buff_info *) ev.data.ptr;
+                struct buff_info * cb = (struct buff_info *) ev.data.ptr;
                 cb->line_index = 0;
                 cb->curr_len_line = 0;
+                cb->cfd = cfd;
 
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev) == -1) {
                     printf("Error Adding to EPOLL: %s\n", strerror(errno));
@@ -516,35 +526,30 @@ int main(int argc, char * argv[])
                 while ((bytesRead = read(file_to_send_fd, buffer, BUFFER_RW_SIZE)) > 0) {
 
                     printf("Sending file fragment %d to a client\n", file_index);
-                    write(cfd, buffer, BUFFER_RW_SIZE);
+                    write(cfd, buffer, bytesRead);
 
-                    memset(buffer, 0, BUFFER_RW_SIZE);
+                    memset(buffer, 0, bytesRead);
                 }
 
-                if(bytesRead == -1)
-                {
-                    printf("Error Reading Fragment File %d: %s\n", file_index, strerror(errno));
-                    return ERROR_READING_FILE;
-                }
+                char * end_message = "EOF\n";
+                write(cfd, end_message, sizeof(end_message));
 
                 //increment file index to prepare sending next file
                 file_index++;
-
-                return SUCCESS;
                 
 			}
 
             //Receiving Info from client!
             if((fd != sfd) && (events & EPOLLIN))
             {
+                printf("AAH\n");
                 int index;
                 int last_index = 0;
 
                 char buf[BUFFER_RW_SIZE];
                 memset(buf, 0, BUFFER_RW_SIZE);
-                read(fd, buf, BUFFER_RW_SIZE);
-
-                struct client_buff_info * cb = (struct client_buff_info *) ev.data.ptr;
+                ssize_t bytes_read;
+                while((bytes_read = read(fd, buf, BUFFER_RW_SIZE)) < 0);
 
                 //each time we find the next delim, we start where we left off by adding last_index
                 while ((index = position_delim(buf + last_index, BUFFER_RW_SIZE - last_index, DELIMITER)) != -1) {
@@ -554,12 +559,14 @@ int main(int argc, char * argv[])
                     //so the indexes need to be accumulated
                     index += last_index;
 
-                    get_mem_for_line(line, &cb->line_index, &cb->curr_len_line, index - last_index);
+                    get_mem_for_line(&line, &cb->line_index, &cb->curr_len_line, index - last_index + 1);
 
-                    line[cb->curr_len_line - 1] = '\0';
+                    line[cb->curr_len_line] = '\0';
 
                     // Copy the message fragment that ends at the delimiter.
-                    memcpy(line + cb->line_index, buf + last_index, index - last_index);
+                    memcpy(line + cb->line_index, buf + last_index, index - last_index + 1);
+
+                    printf("%s\n", line);
 
                     int line_num;
                     sscanf(line, "%d", &line_num);
@@ -577,28 +584,35 @@ int main(int argc, char * argv[])
                 }
                 
 
-                //if there is still some chars left in buffer (ie we have not reached the delimiter once reaching the end)
-                if(last_index < BUFFER_RW_SIZE)
-                {
+                if (last_index < bytes_read) {
                     int buffer_size;
-
-                    //There might not be a full buffer (ie there might be a '\0' character before the end)
-                    //do not want to write a bunch of '\0' in between strings
-                    if((index = position_delim(buf + last_index, BUFFER_RW_SIZE - last_index, '\0')) == -1)
-                    {
-                        //no terminating char
-                        buffer_size = BUFFER_RW_SIZE;
+                
+                    // search only the valid remainder, not the full BUFFER_RW_SIZE
+                    index = position_delim(buf + last_index,
+                                            bytes_read - last_index,
+                                            DELIMITER);
+                    if (index == -1) {
+                        // no delimiter found in what we read
+                        buffer_size = bytes_read;
+                    } else {
+                        // index is relative to buf+last_index, so add last_index for absolute
+                        buffer_size = last_index + index;
                     }
-                    else
-                    {
-                        buffer_size = index + last_index;
+                
+                    // only copy if there’s something new
+                    if (last_index < buffer_size) {
+                        int copy_len = buffer_size - last_index;
+                        // grow our line buffer by exactly copy_len bytes
+                        get_mem_for_line(&line,
+                                            &cb->line_index,
+                                            &cb->curr_len_line,
+                                            copy_len);
+                        // copy just those bytes
+                        memcpy(line + cb->line_index,
+                                buf + last_index,
+                                copy_len);
+                        cb->line_index += copy_len;
                     }
-
-                    get_mem_for_line(line, &cb->line_index, &cb->curr_len_line, index - last_index);
-
-                    memcpy(line + cb->line_index, buf + last_index, buffer_size - last_index);
-                    cb->line_index += (buffer_size - last_index);
-                    
                 }
 
                 //set the buf back to '\0' chars
@@ -610,15 +624,18 @@ int main(int argc, char * argv[])
             {
                 printf("Client disconnected!\n");
 				ev.events = EPOLLIN | EPOLLRDHUP;
-				ev.data.fd = cfd;
-                free(ev.data.ptr);
-				epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, NULL);
+				
+                
+				epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, &evlist[i]);
+                free(evlist[i].data.ptr);
 				close(cfd);
+                num_clients_done++;
             }
         }
 
     }
 
+    printf("Here\n");
     int curr_len_line;
     int line_index;
     //print out recombined file
@@ -631,7 +648,7 @@ int main(int argc, char * argv[])
         printf("%s", min_node->line_num);
 
         //delete and free lowest line number node
-        delete_node(root, min_node);
+        root = delete_node(root, min_node);
     }
 
     //close and free all opened files

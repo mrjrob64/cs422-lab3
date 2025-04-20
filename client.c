@@ -221,7 +221,7 @@ int position_delim(char * str, int len, char delim)
 void get_mem_for_line(char ** line, int * line_index, int * curr_len_line, int amount)
 {
     //case 1: line has nothing in it rn
-    if(line == NULL)
+    if(*line == NULL)
     {
         *line_index = 0;
         *curr_len_line = amount;
@@ -350,15 +350,17 @@ int main(int argc, char ** argv)
     char buf [BUFFER_RW_SIZE];
     memset(buf, 0, BUFFER_RW_SIZE);
 
-    char * line;
+    char * line = NULL;
     int line_index = 0;
     int curr_len_line = 0;
     struct btree *root = NULL;
 
     ssize_t bytes_read;
+    int cont = 1;
     //Add functionality from buffer to string
-    while((bytes_read = read(sfd, buf, BUFFER_RW_SIZE)) != EOF)
+    while(cont)
     {
+        while((bytes_read = read(sfd, buf, BUFFER_RW_SIZE)) < 0);
         //failed to read bytes so trying again
         if(bytes_read == -1)
         {
@@ -375,12 +377,21 @@ int main(int argc, char ** argv)
             //so the indexes need to be accumulated
             index += last_index;
 
-            get_mem_for_line(&line, &line_index, &curr_len_line, index - last_index);
+            get_mem_for_line(&line, &line_index, &curr_len_line, index - last_index + 1);
 
             line[curr_len_line] = '\0';
 
             // Copy the message fragment that ends at the delimiter.
-            memcpy(line + line_index, buf + last_index, index - last_index);
+            memcpy(line + line_index, buf + last_index, index - last_index + 1);
+
+            if(strcmp(line, "EOF\n") == 0)
+            {
+                free(line);
+                cont = 0;
+                break;
+            }
+
+            printf("%s\n", line);
 
             int line_num;
             sscanf(line, "%d", &line_num);
@@ -398,33 +409,44 @@ int main(int argc, char ** argv)
         }
         
 
-        //if there is still some chars left in buffer (ie we have not reached the delimiter once reaching the end)
-        if(last_index < BUFFER_RW_SIZE)
-        {
+        if (last_index < bytes_read) {
             int buffer_size;
-
-            //There might not be a full buffer (ie there might be a '\0' character before the end)
-            //do not want to write a bunch of '\0' in between strings
-            if((index = position_delim(buf + last_index, BUFFER_RW_SIZE - last_index, '\0')) == -1)
-            {
-                //no terminating char
-                buffer_size = BUFFER_RW_SIZE;
+        
+            // search only the valid remainder, not the full BUFFER_RW_SIZE
+            index = position_delim(buf + last_index,
+                                   bytes_read - last_index,
+                                   '\0');
+            if (index == -1) {
+                // no delimiter found in what we read
+                buffer_size = bytes_read;
+            } else {
+                // index is relative to buf+last_index, so add last_index for absolute
+                buffer_size = last_index + index;
             }
-            else
-            {
-                buffer_size = index + last_index;
+        
+            // only copy if there’s something new
+            if (last_index < buffer_size) {
+                int copy_len = buffer_size - last_index;
+                // grow our line buffer by exactly copy_len bytes
+                get_mem_for_line(&line,
+                                 &line_index,
+                                 &curr_len_line,
+                                 copy_len);
+                // copy just those bytes
+                memcpy(line + line_index,
+                       buf + last_index,
+                       copy_len);
+                line_index += copy_len;
             }
-
-            get_mem_for_line(&line, &line_index, &curr_len_line, index - last_index);
-
-            memcpy(line + line_index, buf + last_index, buffer_size - last_index);
-            line_index += (buffer_size - last_index);
-            
         }
+        
+        printf("AAAAH\n");
 
         //set the buf back to '\0' chars
         memset(buf, 0, BUFFER_RW_SIZE);
     }
+
+    printf("read all lines!\n");
 
     if(bytes_read == -1)
     {
@@ -438,6 +460,8 @@ int main(int argc, char ** argv)
         //get lowest line number node
         struct btree * min_node = find_min(root);
 
+        printf("%s", min_node->line);
+
         //write the string in sizes of BUFFER_RW_SIZE until reached end
         line = min_node->line;
         curr_len_line = min_node->line_length;
@@ -446,18 +470,18 @@ int main(int argc, char ** argv)
         {
             if(line_index - curr_len_line < BUFFER_RW_SIZE)
             {
-                write(sfd, line + line_index, line_index - curr_len_line);
+                write(sfd, line + line_index, curr_len_line);
             }
             else
             {
                 write(sfd, line + line_index, BUFFER_RW_SIZE);
             }
             
-            line += BUFFER_RW_SIZE;
+            line_index += BUFFER_RW_SIZE;
         }
 
         //delete and free lowest line number node
-        delete_node(root, min_node);
+        root = delete_node(root, min_node);
     }
 
 	if(close(sfd) == -1)
