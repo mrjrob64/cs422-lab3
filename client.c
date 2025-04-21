@@ -236,8 +236,8 @@ void get_mem_for_line(char ** line, int * line_index, int * curr_len_line, int a
         *line_index = *curr_len_line;
         *curr_len_line += amount;
 
-        //should already have the additional char for end string '\0'
-        *line = realloc(*line, (*curr_len_line) * sizeof(char));
+        //1 additional char for end string '\0'
+        *line = realloc(*line, (*curr_len_line + 1) * sizeof(char));
 
     }
 }
@@ -387,11 +387,12 @@ int main(int argc, char ** argv)
             if(strcmp(line, "EOF\n") == 0)
             {
                 free(line);
+                line = NULL;
                 cont = 0;
                 break;
             }
 
-            printf("%s\n", line);
+            //printf("%s\n", line);
 
             int line_num;
             sscanf(line, "%d", &line_num);
@@ -409,7 +410,7 @@ int main(int argc, char ** argv)
         }
         
 
-        if (last_index < bytes_read) {
+        if (cont && last_index < bytes_read) {
             int buffer_size;
         
             // search only the valid remainder, not the full BUFFER_RW_SIZE
@@ -446,6 +447,7 @@ int main(int argc, char ** argv)
         memset(buf, 0, BUFFER_RW_SIZE);
     }
 
+
     printf("read all lines!\n");
 
     if(bytes_read == -1)
@@ -460,7 +462,7 @@ int main(int argc, char ** argv)
         //get lowest line number node
         struct btree * min_node = find_min(root);
 
-        printf("%s", min_node->line);
+        //printf("%s", min_node->line);
 
         //write the string in sizes of BUFFER_RW_SIZE until reached end
         line = min_node->line;
@@ -482,6 +484,12 @@ int main(int argc, char ** argv)
 
         //delete and free lowest line number node
         root = delete_node(root, min_node);
+    }
+
+    char * end_message = "EOF\n";
+    if(write(sfd, end_message, strlen(end_message)) <= 0)
+    {
+        printf("WEIRD WRITE STUFF\n");
     }
 
 	if(close(sfd) == -1)

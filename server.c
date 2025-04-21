@@ -35,7 +35,7 @@
 #define DECIMAL_NUM 10
 
 //constants for socket functions
-#define LISTENING_BACKLOG 50
+#define LISTENING_BACKLOG 1024
 #define HOST_MAX_LEN 1024
 
 #define BUFFER_RW_SIZE 1024
@@ -50,6 +50,10 @@ struct buff_info
     int cfd;
     int line_index;
     int curr_len_line;
+    int file_closed;
+    int done_reading;
+    char * line;
+    int client_index;
 };
 
 //Balanced AVL Tree created partly by me and partly by chatgpt
@@ -197,8 +201,22 @@ struct btree *delete_node(struct btree *root, struct btree *node) {
         }
         else {
             struct btree *succ = find_min(root->right);
-            root->line_num = succ->line_num;
-            root->line = succ->line;
+            if (root->line) {
+                free(root->line);
+                // No need to set root->line = NULL yet, it's about to be overwritten
+            }
+
+            // 2. Copy the inorder successor's data to this node
+            root->line_num    = succ->line_num;
+            root->line        = succ->line;        // Take ownership of successor's line pointer
+            root->line_length = succ->line_length; // Copy length too
+
+            // 3. IMPORTANT: Nullify the original successor's line pointer.
+            //    This prevents the recursive delete call below from freeing
+            //    the memory that 'root' now points to.
+            succ->line        = NULL;
+            succ->line_length = 0; // Also reset length for consistency
+
             root->right = delete_node(root->right, succ);
         }
     }
@@ -242,7 +260,7 @@ void get_mem_for_line(char ** line, int * line_index, int * curr_len_line, int a
         *curr_len_line += amount;
 
         //should already have the additional char for end string '\0'
-        *line = realloc(*line, (*curr_len_line) * sizeof(char));
+        *line = realloc(*line, (*curr_len_line + 1) * sizeof(char));
 
     }
 }
@@ -415,6 +433,8 @@ int main(int argc, char * argv[])
     free(line);
     fclose(file_cmd_input);
 
+    line = NULL;
+
     //SOCKET TIME YO!
 
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -452,18 +472,21 @@ int main(int argc, char * argv[])
     //Going to use epoll to wait for clients
     int epfd = epoll_create1(0);
 
-	struct epoll_event * evlist = (struct epoll_event *) malloc(sizeof(struct epoll_event) * num_fragment_files);
+	struct epoll_event * evlist = (struct epoll_event *) malloc(sizeof(struct epoll_event) * (num_fragment_files + 1));
 
 	//add event listener for stdin
-	struct epoll_event ev;
-	ev.events = EPOLLIN;
+	struct epoll_event ev_server;
+	ev_server.events = EPOLLIN;
 
-    ev.data.ptr = malloc(sizeof(struct buff_info));
+    ev_server.data.ptr = malloc(sizeof(struct buff_info));
 
-    struct buff_info * cb = (struct buff_info *) ev.data.ptr;
-    cb->cfd = sfd;
+    struct epoll_event ev;
 
-	if (epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev) == -1)
+    struct buff_info * sb = (struct buff_info *) ev_server.data.ptr;
+    sb->cfd = sfd;
+    sb->client_index = -1;
+
+	if (epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev_server) == -1)
 	{
 		printf("Error Setting up epoll STDIN: %s\n", strerror(errno));
 		return 1;
@@ -479,19 +502,20 @@ int main(int argc, char * argv[])
 
     while(num_clients_done < num_fragment_files)
 	{
-        int num_events = epoll_wait(epfd, evlist, num_fragment_files, -1);
-        printf("smth happened.\n");
+        int num_events = epoll_wait(epfd, evlist, num_fragment_files + 1, -1);
+        printf("num clients %d.\n", num_clients_done);
 
         for(int i = 0; i < num_events; i++)
         {
 
             struct buff_info * cb = (struct buff_info *) evlist[i].data.ptr;
+            printf("client %d has data\n", cb->client_index);
 
             int fd = cb->cfd;
 			uint32_t events = evlist[i].events;
 
             //New Connection!
-            if ((fd == sfd) && (events & EPOLLIN)) {
+            if ((fd == sfd) && (events & EPOLLIN) && file_index < num_fragment_files) {
 				struct sockaddr_in c_addr;
                 socklen_t clen = sizeof(struct sockaddr_in);
                 cfd = accept(sfd, (struct sockaddr *) &c_addr, &clen );
@@ -511,12 +535,17 @@ int main(int argc, char * argv[])
                 struct buff_info * cb = (struct buff_info *) ev.data.ptr;
                 cb->line_index = 0;
                 cb->curr_len_line = 0;
+                cb->done_reading = 0;
+                cb->file_closed = 0;
                 cb->cfd = cfd;
+                cb->line = NULL;
+                cb->client_index = file_index;
 
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev) == -1) {
                     printf("Error Adding to EPOLL: %s\n", strerror(errno));
                     return EPOLL_ISSUE;
                 }
+                ev.data.ptr = NULL;
 
                 //send data from current file to client
                 int file_to_send_fd = fragment_files[file_index];
@@ -532,10 +561,11 @@ int main(int argc, char * argv[])
                 }
 
                 char * end_message = "EOF\n";
-                write(cfd, end_message, sizeof(end_message));
+                write(cfd, end_message, strlen(end_message));
 
                 //increment file index to prepare sending next file
                 file_index++;
+
                 
 			}
 
@@ -551,6 +581,8 @@ int main(int argc, char * argv[])
                 ssize_t bytes_read;
                 while((bytes_read = read(fd, buf, BUFFER_RW_SIZE)) < 0);
 
+                int skip = 0;
+
                 //each time we find the next delim, we start where we left off by adding last_index
                 while ((index = position_delim(buf + last_index, BUFFER_RW_SIZE - last_index, DELIMITER)) != -1) {
 
@@ -559,21 +591,35 @@ int main(int argc, char * argv[])
                     //so the indexes need to be accumulated
                     index += last_index;
 
-                    get_mem_for_line(&line, &cb->line_index, &cb->curr_len_line, index - last_index + 1);
+                    get_mem_for_line(&cb->line, &cb->line_index, &cb->curr_len_line, index - last_index + 1);
 
-                    line[cb->curr_len_line] = '\0';
+                    cb->line[cb->curr_len_line] = '\0';
 
                     // Copy the message fragment that ends at the delimiter.
-                    memcpy(line + cb->line_index, buf + last_index, index - last_index + 1);
+                    memcpy(cb->line + cb->line_index, buf + last_index, index - last_index + 1);
 
-                    printf("%s\n", line);
+                    
+
+                    if(strcmp(cb->line, "EOF\n") == 0)
+                    {
+                        cb->done_reading = 1;
+                        
+                        free(cb->line);
+                        cb->line = NULL;
+                        last_index = index + 1;
+
+                        skip = 1;
+                        break;
+                    }
+
+                    //printf("%s\n", cb->line);
 
                     int line_num;
-                    sscanf(line, "%d", &line_num);
+                    sscanf(cb->line, "%d", &line_num);
 
                     //add the line to the tree data structure
-                    root = add(root, line_num, line, cb->curr_len_line);
-                    line = NULL;
+                    root = add(root, line_num, cb->line, cb->curr_len_line);
+                    cb->line = NULL;
 
                     // Reset for a new message.
                     cb->line_index = 0;
@@ -584,7 +630,7 @@ int main(int argc, char * argv[])
                 }
                 
 
-                if (last_index < bytes_read) {
+                if (!skip && last_index < bytes_read) {
                     int buffer_size;
                 
                     // search only the valid remainder, not the full BUFFER_RW_SIZE
@@ -603,12 +649,12 @@ int main(int argc, char * argv[])
                     if (last_index < buffer_size) {
                         int copy_len = buffer_size - last_index;
                         // grow our line buffer by exactly copy_len bytes
-                        get_mem_for_line(&line,
+                        get_mem_for_line(&cb->line,
                                             &cb->line_index,
                                             &cb->curr_len_line,
                                             copy_len);
                         // copy just those bytes
-                        memcpy(line + cb->line_index,
+                        memcpy(cb->line + cb->line_index,
                                 buf + last_index,
                                 copy_len);
                         cb->line_index += copy_len;
@@ -623,19 +669,32 @@ int main(int argc, char * argv[])
             if((fd != sfd) && (events & EPOLLRDHUP))
             {
                 printf("Client disconnected!\n");
-				ev.events = EPOLLIN | EPOLLRDHUP;
 				
+				cb->file_closed = 1;
                 
-				epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, &evlist[i]);
+				
+            }
+
+            if((fd != sfd) && cb->file_closed && cb->done_reading)
+            {
+                printf("Client on fd %d finished, line count = %d\n", cb->cfd, cb->client_index);
+                //ev.events = EPOLLIN | EPOLLRDHUP;
+                epoll_ctl(epfd, EPOLL_CTL_DEL, cb->cfd, &evlist[i]);
+                close(cb->cfd);
                 free(evlist[i].data.ptr);
-				close(cfd);
+                
                 num_clients_done++;
             }
         }
 
+        
+
     }
 
-    printf("Here\n");
+    free(ev_server.data.ptr);
+
+    //printf("Here\n");
+    //printf("%s", root->line);
     int curr_len_line;
     int line_index;
     //print out recombined file
@@ -645,7 +704,7 @@ int main(int argc, char * argv[])
         struct btree * min_node = find_min(root);
 
         //print the line to the terminal
-        printf("%s", min_node->line_num);
+        printf("%s", min_node->line);
 
         //delete and free lowest line number node
         root = delete_node(root, min_node);
