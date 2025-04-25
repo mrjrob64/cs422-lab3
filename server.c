@@ -466,11 +466,6 @@ int main(int argc, char * argv[])
     line = NULL;
 
     print_host_network_info();
-    if(!network_info_res)
-    {
-        close_fragments(num_fragment_files, fragment_files);
-        return network_info_res;
-    }
 
     //SOCKET TIME YO!
 

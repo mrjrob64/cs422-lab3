@@ -313,7 +313,6 @@ void print_host_network_info()
     }
 
     freeaddrinfo(res);
-    return 0;
 
 }
 
