@@ -15,6 +15,10 @@ echo "Running $NUM_FRAGMENTS client(s) connecting to $SERVER_IP:$SERVER_PORT"
 for ((i = 1; i <= NUM_FRAGMENTS; i++)); do
   echo "Running client #$i"
   ./client "$SERVER_IP" "$SERVER_PORT" &
+  process_pid=$!
+  sleep 0.001
+  kill $process_pid
+
 
 done
 

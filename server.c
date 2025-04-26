@@ -25,6 +25,7 @@
 #define ERROR_READING_FILE 7
 #define ERROR_GETTING_ADDRESS_INFO 8
 #define ERROR_EPOLL_SETUP 9
+#define FAILED_TO_CLOSE_SOCKET 10
 
 #define EXPECTED_ARGS 2
 
@@ -289,6 +290,56 @@ void close_fragments(int n, int * fragment_files)
     free(fragment_files);
 }
 
+//free up to n buff_info structs
+//returns whether all the sockets were closed
+//so that when finishing we can tell if a socket
+//was not closed correctly
+int cleanup_buffinfo(int n, struct buff_info ** buff_info_list)
+{
+    int failed_to_close_a_socket = 0;
+    //skip the listening socket info object
+    for(int i = 0; i < n; i++)
+    {
+        if(close(buff_info_list[i]->cfd) == -1)
+        {
+            failed_to_close_a_socket = 1;
+        }
+        
+        //check if line has not been put into tree yet
+        if(buff_info_list[i]->line)
+        {
+            free(buff_info_list[i]->line);
+        }
+
+        free(buff_info_list[i]);
+    }
+    free(buff_info_list);
+
+    if(failed_to_close_a_socket)
+    {
+        return FAILED_TO_CLOSE_SOCKET;
+    }
+    return SUCCESS;
+}
+
+//main loop error clean up
+//returns whether the sockets were all closed correctly
+//if something else didn't go wrong first we want to 
+//know if all the sockets closed properly
+int clean_all(struct buff_info ** buff_info_list, int n, int num_fragments, 
+               int * fragment_files, struct btree * root, FILE * file_original,
+               struct epoll_event * evlist)
+{
+    
+    fclose(file_original);
+    free(evlist);
+    close_fragments(num_fragments, fragment_files);
+    free_tree(root);
+    int ret_val = cleanup_buffinfo(n, buff_info_list);
+    
+    return ret_val;
+}
+
 int usage(char * message)
 {
 
@@ -523,12 +574,15 @@ int main(int argc, char * argv[])
     struct buff_info * sb = (struct buff_info *) ev_server.data.ptr;
     sb->cfd = sfd;
     sb->client_index = -1;
+    sb->line = NULL;
+    sb->curr_len_line = 0;
 
 	if (epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev_server) == -1)
 	{
 		printf("Error Setting up epoll STDIN: %s\n", strerror(errno));
         close_fragments(index, fragment_files);
         close(sfd);
+        free(ev_server.data.ptr);
 		return ERROR_EPOLL_SETUP;
 	}
 
@@ -540,16 +594,21 @@ int main(int argc, char * argv[])
 
     struct btree *root = NULL;
 
+    //keep track of buff_info structs to clean them up if anything goes wrong
+    struct buff_info ** buff_info_list = malloc(sizeof(struct buff_info *) * (num_fragment_files + 1));
+    buff_info_list[0] = sb;
+
+    ssize_t bytesWritten;
+    ssize_t bytesRead;
+
     while(num_clients_done < num_fragment_files)
 	{
         int num_events = epoll_wait(epfd, evlist, num_fragment_files + 1, -1);
-        printf("num clients %d.\n", num_clients_done);
 
         for(int i = 0; i < num_events; i++)
         {
 
             struct buff_info * cb = (struct buff_info *) evlist[i].data.ptr;
-            printf("client %d has data\n", cb->client_index);
 
             int fd = cb->cfd;
 			uint32_t events = evlist[i].events;
@@ -582,11 +641,13 @@ int main(int argc, char * argv[])
                 cb->line = NULL;
                 cb->client_index = file_index;
 
+                buff_info_list[file_index + 1] = cb;
+
+                int total_clients = file_index + 1;
+
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &ev) == -1) {
                     printf("Error Adding to EPOLL: %s\n", strerror(errno));
-                    close_fragments(index, fragment_files);
-                    close(sfd);
-                    free_tree(root);
+                    clean_all(buff_info_list, total_clients + 1, num_fragment_files, fragment_files, root, file_original, evlist);
                     return EPOLL_ISSUE;
                 }
                 ev.data.ptr = NULL;
@@ -595,18 +656,63 @@ int main(int argc, char * argv[])
                 int file_to_send_fd = fragment_files[file_index];
                 char buffer[BUFFER_RW_SIZE];
                 memset(buffer, 0, BUFFER_RW_SIZE);
-                ssize_t bytesRead;
-                while ((bytesRead = read(file_to_send_fd, buffer, BUFFER_RW_SIZE)) > 0) {
 
-                    printf("Sending file fragment %d to a client\n", file_index);
-                    write(cfd, buffer, bytesRead);
+                printf("Sending file fragment %d to a client\n", file_index);
+                while ((bytesRead = read(file_to_send_fd, buffer, BUFFER_RW_SIZE)) != 0) {
+                    
+                    if(bytesRead == -1)
+                    {
+                        if(errno == EINTR)
+                        {
+                            continue;
+                        }
+                        printf("Error Reading from a fragment file: %s\n", strerror(errno));
+                        clean_all(buff_info_list, total_clients + 1, num_fragment_files, fragment_files, root, file_original, evlist);
+                        return ERROR_READING_FILE;
+                    }
+
+                    ssize_t bytesWrittenTotal = 0;
+                    while(bytesWrittenTotal != bytesRead)
+                    {
+                        bytesWritten = write(cfd, buffer + bytesWrittenTotal, bytesRead - bytesWrittenTotal);
+                        if(bytesWritten == -1)
+                        {
+                            if(errno == EINTR)
+                            {
+                                continue;
+                            }
+                            printf("Error Writing to Client: %s\n", strerror(errno));
+                            clean_all(buff_info_list, total_clients + 1, num_fragment_files, fragment_files, root, file_original, evlist);
+                            return SOCKET_ISSUE;
+                        }
+                        
+                        bytesWrittenTotal += bytesWritten;
+                        
+                    }
 
                     memset(buffer, 0, bytesRead);
                 }
 
                 char * end_message = "EOF\n";
-                write(cfd, end_message, strlen(end_message));
+                ssize_t bytesWrittenTotal = 0;
 
+                while(bytesWrittenTotal != strlen(end_message))
+                {
+                    bytesWritten = write(cfd, end_message + bytesWrittenTotal, strlen(end_message) - bytesWrittenTotal);
+                    if(bytesWritten == -1)
+                    {
+                        if(errno == EINTR)
+                        {
+                            continue;
+                        }
+                        printf("Error Writing to Client: %s\n", strerror(errno));
+                        clean_all(buff_info_list, total_clients + 1, num_fragment_files, fragment_files, root, file_original, evlist);
+                        return SOCKET_ISSUE;
+                    }
+
+                    bytesWrittenTotal += bytesWritten;
+                }
+                
                 //increment file index to prepare sending next file
                 file_index++;
                 
@@ -620,13 +726,34 @@ int main(int argc, char * argv[])
 
                 char buf[BUFFER_RW_SIZE];
                 memset(buf, 0, BUFFER_RW_SIZE);
-                ssize_t bytes_read;
-                while((bytes_read = read(fd, buf, BUFFER_RW_SIZE)) < 0);
+                while((bytesRead = read(fd, buf, BUFFER_RW_SIZE)) == -1)
+                {
+                    if(bytesRead == -1)
+                    {
+                        if(errno == EINTR)
+                        {
+                            continue;
+                        }
+                        printf("Error Reading from Client: %s\n", strerror(errno));
+                        clean_all(buff_info_list, file_index + 1, num_fragment_files, fragment_files, root, file_original, evlist);
+                        return SOCKET_ISSUE;
+                    }          
+                }
+
+                //if the file is closed prematurely ie we get 0 before "EOF\n"
+                //then there is an error with the connection between a client
+                if(bytesRead == 0 && !cb->done_reading)
+                {
+                    printf("Socket Closed Prematurely: %s\n", strerror(errno));
+                    clean_all(buff_info_list, file_index + 1, num_fragment_files, fragment_files, root, file_original, evlist);
+                    return SOCKET_ISSUE;
+                }
 
                 int skip = 0;
 
+
                 //each time we find the next delim, we start where we left off by adding last_index
-                while ((index = position_delim(buf + last_index, BUFFER_RW_SIZE - last_index, DELIMITER)) != -1) {
+                while ((index = position_delim(buf + last_index, bytesRead - last_index, DELIMITER)) != -1) {
 
 
                     //index does not start from beggining every time
@@ -641,7 +768,6 @@ int main(int argc, char * argv[])
                     memcpy(cb->line + cb->line_index, buf + last_index, index - last_index + 1);
 
                     
-
                     if(strcmp(cb->line, "EOF\n") == 0)
                     {
                         cb->done_reading = 1;
@@ -679,16 +805,16 @@ int main(int argc, char * argv[])
                 }
                 
 
-                if (!skip && last_index < bytes_read) {
+                if (!skip && last_index < bytesRead) {
                     int buffer_size;
                 
                     // search only the valid remainder, not the full BUFFER_RW_SIZE
                     index = position_delim(buf + last_index,
-                                            bytes_read - last_index,
+                                            bytesRead - last_index,
                                             DELIMITER);
                     if (index == -1) {
                         // no delimiter found in what we read
-                        buffer_size = bytes_read;
+                        buffer_size = bytesRead;
                     } else {
                         // index is relative to buf+last_index, so add last_index for absolute
                         buffer_size = last_index + index;
@@ -728,28 +854,23 @@ int main(int argc, char * argv[])
                 //ev.events = EPOLLIN | EPOLLRDHUP;
                 if(epoll_ctl(epfd, EPOLL_CTL_DEL, cb->cfd, &evlist[i]) == -1) {
                     printf("Error Adding to EPOLL: %s\n", strerror(errno));
-                    close_fragments(index, fragment_files);
-                    close(sfd);
-                    free_tree(root);
+                    clean_all(buff_info_list, file_index + 1, num_fragment_files, fragment_files, root, file_original, evlist);
                     return EPOLL_ISSUE;
                 }
-
-                close(cb->cfd);
-                free(evlist[i].data.ptr);
                 
                 num_clients_done++;
             }
         }
 
-        
-
     }
 
-    free(ev_server.data.ptr);
-    close(sfd);
 
     int curr_len_line;
     int line_index;
+
+    char * og_line = NULL;
+    size_t og_size = 0;
+    int num_lines_diff = 0;
     //print out recombined file
     while(root != NULL)
     {
@@ -759,17 +880,38 @@ int main(int argc, char * argv[])
         //print the line to the terminal
         printf("%s", min_node->line);
 
+        //check if it matches the original line
+        if(getline(&og_line, &og_size, file_original) == -1)
+        {
+            printf("getline for the original file reached an error\n");
+            clean_all(buff_info_list, file_index + 1, num_fragment_files, fragment_files, root, file_original, evlist);
+            return ERROR_READING_FILE;
+        }
+
+        //find index of space
+        int index = position_delim(min_node->line, min_node->line_length + 1, ' ');
+
+        if(index == -1 || strcmp(og_line, min_node->line + index + 1) != 0)
+        {
+            printf("Line %d in original file and sorted fragments\n");
+            num_lines_diff++;
+        }
+
         //delete and free lowest line number node
         root = delete_node(root, min_node);
     }
 
-    //close and free all opened files
-    fclose(file_original);
-    close_fragments(index, fragment_files);
+    if(num_lines_diff == 0)
+    {
+        printf("All lines were the same\n");
+    }
+    else
+    {
+        printf("%d lines were not the same\n", num_lines_diff);
+    }
 
-    //free epoll structure
-    free(evlist);
+    free(og_line);
 
-    return SUCCESS;
+    return clean_all(buff_info_list, file_index + 1, num_fragment_files, fragment_files, root, file_original, evlist);
 
 }

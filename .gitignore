@@ -54,8 +54,11 @@ dkms.conf
 #my executables
 server
 client
+test
+test.c
 
 #other stuff
 settings.json
 c_cpp_properties.json
 launch.json
+test

@@ -22,6 +22,7 @@
 #define FAILED_TO_CLOSE_FD 2
 #define FAILED_TO_READ_FD 3
 #define SOCKET_ISSUE 5
+#define FAILED_TO_CLOSE_SOCKET 10
 
 #define EXPECTED_ARGS 2
 
@@ -326,21 +327,21 @@ int main(int argc, char ** argv)
 		return usage("You can only have 2 argument");
 	}
 
-	int sfd = socket(AF_INET, SOCK_STREAM, 0);
-
-	//check if valid socket file descriptor
-	if(sfd == -1)
-	{
-		printf("Error Creating Socket: %s\n", strerror(errno));
-		return SOCKET_ISSUE;
-	}
-
 	char * server_ip = argv[IP_ARG];
 	
     int port;
 	if(!string_to_int(&port, argv[PORT_ARG]))
 	{
 		return usage("you did not give a number for the port");
+	}
+
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+
+	//check if valid socket file descriptor
+	if(sfd == -1)
+	{
+		printf("Error Creating Socket: %s\n", strerror(errno));
+		return SOCKET_ISSUE;
 	}
 	
     struct sockaddr_in addr;
@@ -351,12 +352,14 @@ int main(int argc, char ** argv)
     addr.sin_port = htons(port);
     if(inet_aton(server_ip, &addr.sin_addr) == -1)
 	{
+        close(sfd);
 		printf("Error Setting IP: %s\n", strerror(errno));
 		return SOCKET_ISSUE;
 	}
 
 	if(connect(sfd, (struct sockaddr *) &addr, sizeof(struct sockaddr_in)) == -1)
 	{
+        close(sfd);
 		printf("Error Connecting: %s\n", strerror(errno));
 		return SOCKET_ISSUE;
 	}
@@ -373,10 +376,10 @@ int main(int argc, char ** argv)
 
     ssize_t bytes_read;
     int cont = 1;
-    //Add functionality from buffer to string
+    
     while(cont)
     {
-        while((bytes_read = read(sfd, buf, BUFFER_RW_SIZE)) < 0);
+        bytes_read = read(sfd, buf, BUFFER_RW_SIZE);
         //failed to read bytes so trying again
         if(bytes_read == -1)
         {
@@ -400,7 +403,7 @@ int main(int argc, char ** argv)
         int last_index = 0;
 
         //each time we find the next delim, we start where we left off by adding last_index
-        while ((index = position_delim(buf + last_index, BUFFER_RW_SIZE - last_index, DELIMITER)) != -1) {
+        while ((index = position_delim(buf + last_index, bytes_read - last_index, DELIMITER)) != -1) {
 
 
             //index does not start from beggining every time
@@ -421,8 +424,6 @@ int main(int argc, char ** argv)
                 cont = 0;
                 break;
             }
-
-            //printf("%s\n", line);
 
             int line_num;
             if(sscanf(line, "%d", &line_num) == 1)
@@ -498,19 +499,27 @@ int main(int argc, char ** argv)
         //write the string in sizes of BUFFER_RW_SIZE until reached end
         line = min_node->line;
         curr_len_line = min_node->line_length;
-        line_index = 0;
-        while(line_index < curr_len_line)
+        
+        ssize_t totalBytesWritten = 0;
+        ssize_t bytesWritten;
+
+        while(totalBytesWritten != curr_len_line)
         {
-            if(line_index - curr_len_line < BUFFER_RW_SIZE)
+            bytesWritten = write(sfd, line + totalBytesWritten, curr_len_line - totalBytesWritten);
+
+            if(bytesWritten == -1)
             {
-                write(sfd, line + line_index, curr_len_line);
+                if(errno == EINTR)
+                {
+                    continue;
+                }
+                printf("Error Writing to Client: %s\n", strerror(errno));
+                free_tree(root);
+                close(sfd);
+                return SOCKET_ISSUE;
             }
-            else
-            {
-                write(sfd, line + line_index, BUFFER_RW_SIZE);
-            }
-            
-            line_index += BUFFER_RW_SIZE;
+
+            totalBytesWritten += bytesWritten;
         }
 
         //delete and free lowest line number node
@@ -518,17 +527,35 @@ int main(int argc, char ** argv)
     }
 
     char * end_message = "EOF\n";
-    if(write(sfd, end_message, strlen(end_message)) <= 0)
+    ssize_t bytesWrittenTotal = 0;
+    ssize_t bytesWritten;
+
+    while(bytesWrittenTotal != strlen(end_message))
     {
-        printf("WEIRD WRITE STUFF\n");
+        bytesWritten = write(sfd, end_message + bytesWrittenTotal, strlen(end_message) - bytesWrittenTotal);
+        if(bytesWritten == -1)
+        {
+            if(errno == EINTR)
+            {
+                continue;
+            }
+            printf("Error Writing to Client: %s\n", strerror(errno));
+            free_tree(root);
+            close(sfd);
+            return SOCKET_ISSUE;
+        }
+
+        bytesWrittenTotal += bytesWritten;
     }
 
-	if(close(sfd) == -1)
-	{
-		printf("Failed to close: %s\n", strerror(errno));
-		return FAILED_TO_CLOSE_FD;
-	}
+    printf("Finished Writing back to Server\n");
 
-	return 0;
+    free_tree(root);
+	if(close(sfd) == -1)
+    {
+        printf("Everything was sent, but failed to close sfd: %s\n", strerror(errno));
+        return FAILED_TO_CLOSE_SOCKET;
+    }
+	return SUCCESS;
 }
 
