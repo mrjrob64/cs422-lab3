@@ -1,12 +1,28 @@
+/*
+client.c - a client program that connects to
+a server which sends it a bunch of lines with
+associated line numbers attached to each of the
+lines. The client puts these lines into a balanced
+AVL tree. Then once all lines have been put
+into this tree, the client sends back all of these
+lines in order and then the client merges all these
+client sorted lines into the full original file
+
+Jeremy Robin - j.i.robin@wustl.edu
+Shawn Fong - f.shawn@wustl.edu
+
+*/
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
-#include <sys/socket.h>     // socket, bind, listen, accept, sockaddr, socklen_t
-#include <netinet/ip.h>     // sockaddr_in, htons
-#include <arpa/inet.h>      // INADDR_ANY
-#include <sys/epoll.h>      // epoll_wait
+#include <sys/socket.h>
+#include <netinet/ip.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
 #include <netdb.h>
 #include <sys/types.h>
 

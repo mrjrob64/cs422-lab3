@@ -1,12 +1,25 @@
+/*
+server.c - a server program that sends fragment
+files to clients that connect. The client
+program sends back sorted fragments back to the
+server which the server. Once the files are sent
+back to the server it sorts them and then prints 
+the resulting sorted lines into a text file
+which match the original sorted array
+
+Jeremy Robin - j.i.robin@wustl.edu
+Shawn Fong - f.shawn@wustl.edu
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
-#include <sys/socket.h>     // socket, bind, listen, accept, sockaddr, socklen_t
-#include <netinet/ip.h>     // sockaddr_in, htons
-#include <arpa/inet.h>      // INADDR_ANY
-#include <sys/epoll.h>      // epoll_wait
+#include <sys/socket.h>
+#include <netinet/ip.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
 #include <netdb.h>
 #include <sys/types.h>
 #include <fcntl.h>
@@ -26,8 +39,11 @@
 #define ERROR_GETTING_ADDRESS_INFO 8
 #define ERROR_EPOLL_SETUP 9
 #define FAILED_TO_CLOSE_SOCKET 10
+#define FAILED_TO_WRITE_OUTPUT_FILE 11
 
 #define EXPECTED_ARGS 2
+
+#define RW_ACCCESS 0666
 
 //argv index of arguments
 #define FILE_ARG 1
@@ -327,11 +343,11 @@ int cleanup_buffinfo(int n, struct buff_info ** buff_info_list)
 //if something else didn't go wrong first we want to 
 //know if all the sockets closed properly
 int clean_all(struct buff_info ** buff_info_list, int n, int num_fragments, 
-               int * fragment_files, struct btree * root, FILE * file_original,
+               int * fragment_files, struct btree * root, int file_original,
                struct epoll_event * evlist)
 {
     
-    fclose(file_original);
+    close(file_original);
     free(evlist);
     close_fragments(num_fragments, fragment_files);
     free_tree(root);
@@ -476,15 +492,23 @@ int main(int argc, char * argv[])
 
     if((nread = getline(&line, &size, file_cmd_input)) == -1)
     {
-        printf("No original file was given\n");
+        printf("Could not create the output file %s\n", line);
         fclose(file_cmd_input);
+        free(line);
         return NO_ORIGINAL_FILE;
     }
 
     //turn end of line char '\n' into '\0'
     line[nread - 1] = '\0';
 
-    FILE * file_original = fopen(line, "r");
+    int file_original = open(line, O_WRONLY | O_CREAT | O_TRUNC, RW_ACCCESS);
+    if(file_original == -1)
+    {
+        printf("OG File did not open\n");
+        free(line);
+        fclose(file_cmd_input);
+        return NO_ORIGINAL_FILE;
+    }
 
     int * fragment_files = NULL;
     int index = 0;
@@ -501,10 +525,13 @@ int main(int argc, char * argv[])
             //file was not correctly given: we should close all opened files
             free(line);
             fclose(file_cmd_input);
+            close(file_original);
+            
+            //only close prev fragment files, so we there are just index files
             close_fragments(index, fragment_files);
             return BAD_FRAGMENT;
         }
-
+        
         index++;
     }
 
@@ -530,6 +557,7 @@ int main(int argc, char * argv[])
 
         //if there is a problem with socket, we still need to close the fragments
         close_fragments(index, fragment_files);
+        close(file_original);
         return SOCKET_ISSUE;
     } 
 
@@ -545,6 +573,7 @@ int main(int argc, char * argv[])
     {
         printf("Error Binding Socket: %s\n", strerror(errno));
         close_fragments(index, fragment_files);
+        close(file_original);
         close(sfd);
         return SOCKET_ISSUE;
     }
@@ -554,6 +583,7 @@ int main(int argc, char * argv[])
     {
         printf("Error Setting up Socket to Listen: %s\n", strerror(errno));
         close_fragments(index, fragment_files);
+        close(file_original);
         close(sfd);
         return SOCKET_ISSUE;
     }
@@ -581,6 +611,7 @@ int main(int argc, char * argv[])
 	{
 		printf("Error Setting up epoll STDIN: %s\n", strerror(errno));
         close_fragments(index, fragment_files);
+        close(file_original);
         close(sfd);
         free(ev_server.data.ptr);
 		return ERROR_EPOLL_SETUP;
@@ -868,9 +899,6 @@ int main(int argc, char * argv[])
     int curr_len_line;
     int line_index;
 
-    char * og_line = NULL;
-    size_t og_size = 0;
-    int num_lines_diff = 0;
     //print out recombined file
     while(root != NULL)
     {
@@ -880,37 +908,37 @@ int main(int argc, char * argv[])
         //print the line to the terminal
         printf("%s", min_node->line);
 
-        //check if it matches the original line
-        if(getline(&og_line, &og_size, file_original) == -1)
-        {
-            printf("getline for the original file reached an error\n");
-            clean_all(buff_info_list, file_index + 1, num_fragment_files, fragment_files, root, file_original, evlist);
-            return ERROR_READING_FILE;
-        }
-
         //find index of space
         int index = position_delim(min_node->line, min_node->line_length + 1, ' ');
 
-        if(index == -1 || strcmp(og_line, min_node->line + index + 1) != 0)
+        if(index != -1)
         {
-            printf("Line %d in original file and sorted fragments\n");
-            num_lines_diff++;
-        }
+            //write to output file
+            int total_write = min_node->line_length - index - 1;
+            char * start_ptr = min_node->line + index + 1;
+            ssize_t totalBytesWritten = 0;
+            while(totalBytesWritten < total_write)
+            {
+                ssize_t bytesWritten = write(file_original, start_ptr + totalBytesWritten, total_write - totalBytesWritten);
+                if(bytesWritten == -1)
+                {
+                    if(errno == EINTR)
+                    {
+                        continue;
+                    }
+                    return FAILED_TO_WRITE_OUTPUT_FILE;
+                }
 
+                totalBytesWritten += bytesWritten;
+            }
+        }
+        
         //delete and free lowest line number node
         root = delete_node(root, min_node);
     }
 
-    if(num_lines_diff == 0)
-    {
-        printf("All lines were the same\n");
-    }
-    else
-    {
-        printf("%d lines were not the same\n", num_lines_diff);
-    }
+    printf("Finished Writing to Original File\n");
 
-    free(og_line);
 
     return clean_all(buff_info_list, file_index + 1, num_fragment_files, fragment_files, root, file_original, evlist);
 
